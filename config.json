@@ -1,0 +1,19 @@
+{
+  "starting_balance": 1000.0,
+  "max_exposure": 200.0,
+  "position_usd": 50.0,
+  "max_positions": 4,
+  "fee_rate": 0.006,
+  "slippage_rate": 0.002,
+  "stop_loss": 0.15,
+  "trailing_activation": 0.12,
+  "trailing_distance": 0.07,
+  "cooldown_minutes": 45,
+  "min_24h_usd_volume": 250000.0,
+  "max_spread_pct": 0.012,
+  "loop_seconds": 300,
+  "scan_limit": 25,
+  "ai_shortlist": 5,
+  "ai_model": "gpt-4.1-mini",
+  "daily_loss_pause_usd": 30.0
+}
