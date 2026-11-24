@@ -259,24 +259,9 @@ def ai_approval(items, cfg):
 
 
 def dashboard(state,cfg,mode='unknown',last_scan=0,errors=0):
-    balances=[]
-    for name in NAMES:
-        b=state['bots'][name]
-        balances.append((name,b, (b['last_equity']/cfg['starting_balance']-1)*100))
-    balances.sort(key=lambda z:z[1]['last_equity'],reverse=True)
-    trs=''.join('<tr><td>'+html.escape(name)+'</td><td>$'+f'{b["last_equity"]:,.2f}'+'</td>'
-                '<td>'+f'{ret:+.2f}%'+ '</td><td>'+str(len(b['positions']))+'</td>'
-                '<td>'+str(b['wins'])+'/'+str(b['losses'])+'</td>'
-                '<td>'+f'{b["max_drawdown"]:.1%}'+'</td><td>'+('PAUSED' if b['paused'] else ('AI NOT CONFIGURED' if name=='Hybrid AI' and not os.getenv('OPENAI_API_KEY') else 'RUNNING'))+'</td></tr>'
-                for name,b,ret in balances)
-    details=''.join('<section><h2>'+html.escape(name)+'</h2><p>Cash: $'+f'{state["bots"][name]["cash"]:,.2f}'+' | Realized P/L: $'+f'{state["bots"][name]["realized_pnl"]:+,.2f}'+'</p><ul>'+(''.join('<li>'+html.escape(p)+' — $'+f'{pos["cost"]:.2f}'+' invested</li>' for p,pos in state['bots'][name]['positions'].items()) or '<li>No open positions</li>')+'</ul></section>' for name in NAMES)
-    page='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coinbase Paper Bot Competition</title><style>body{font:16px system-ui;background:#0b1220;color:#e8eef9;max-width:1050px;margin:30px auto;padding:0 18px}h1{font-size:28px}small,p{color:#a9b7ce}table{border-collapse:collapse;width:100%;background:#131f34;border-radius:12px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2b3850;text-align:left}th{background:#213350}section{background:#131f34;border-radius:12px;padding:12px 22px;margin:16px 0}li{padding:3px}strong{color:#b2d0ff} .scroll{overflow-x:auto}</style></head><body><h1>Coinbase paper-trading competition</h1><p><strong>SIMULATED MONEY ONLY — NO REAL ORDERS.</strong> Each bot starts with $1,000. Regular strategies have a $200 active exposure cap; All on Black can place its full simulated balance in one coin. Sniper listing age is an estimate from candle history, not an official launch date. Fees/slippage are estimates.</p>'''
-    page+='<p>Updated '+html.escape(cb.utc_now())+' UTC | completed cycles '+str(state['cycle'])+' | last pairs scanned '+str(last_scan)+' | errors '+str(errors)+' | '+html.escape(mode)+'</p>'
-    page+='<div class="scroll"><table><thead><tr><th>Bot</th><th>Equity</th><th>Return</th><th>Positions</th><th>Wins/Losses</th><th>Max drawdown</th><th>Status</th></tr></thead><tbody>'+trs+'</tbody></table></div>'+details
-    page+='<p>Leaderboard is updated after scans and refreshed by the browser every 60 seconds. Returns are not performance predictions. See trades.csv, signals.csv, leaderboard.csv for raw records.</p></body></html>'
-    tmp=DASH.with_suffix('.tmp')
-    tmp.write_text(page,encoding='utf-8')
-    os.replace(tmp,DASH)
+    """Render the phone-friendly dashboard from existing paper state and CSV history."""
+    import dashboard_plus
+    dashboard_plus.render(state, cfg, DATA, DASH, NAMES, mode, last_scan, errors)
 
 
 def tick(state,session,cfg):
