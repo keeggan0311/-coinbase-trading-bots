@@ -1,4 +1,4 @@
-"""Five Coinbase public-data paper traders. NO order or authentication endpoints."""
+"""Six Coinbase public-data paper traders. NO order or authentication endpoints."""
 from __future__ import annotations
 import argparse
 import csv
@@ -16,6 +16,7 @@ import requests
 from dotenv import load_dotenv
 import market_base as cb
 import new_listing_sniper as sniper
+import all_on_black as black
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -24,7 +25,7 @@ EVENTS = DATA / 'trades.csv'
 SNAPSHOTS = DATA / 'leaderboard.csv'
 SIGNALS = DATA / 'signals.csv'
 DASH = DATA / 'dashboard.html'
-NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI', 'New Coin Sniper']
+NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI', 'New Coin Sniper', 'All on Black']
 
 
 def config():
@@ -120,6 +121,7 @@ def signal(strategy, f):
         if not (.05 <= draw <= .45 and .008 <= rebound <= .12 and .002 <= h <= .085 and vr >= 1.1): return None
         return round(min(100, 30 + min(30,rebound*300) + min(25,(vr-1)*14) + min(15,draw*100)),1)
     if strategy == 'New Coin Sniper': return None  # separate short-history screen
+    if strategy == 'All on Black': return black.signal(f)
     raise ValueError(strategy)
 
 
@@ -150,9 +152,15 @@ def log_trade(name, action, pair, qty, price, fee, pnl, reason):
 
 
 def enter(name, bot, pair, q, cfg, reason):
-    if bot['paused'] or pair in bot['positions'] or len(bot['positions']) >= cfg['max_positions']: return False
-    used = sum(pos['cost'] for pos in bot['positions'].values())
-    budget = min(cfg['position_usd'], cfg['max_exposure']-used, bot['cash'])
+    if bot['paused'] or pair in bot['positions']: return False
+    if name == 'All on Black':
+        # Strictly paper-only, single concentrated position, fee-inclusive budget.
+        if bot['positions']: return False
+        budget = bot['cash']
+    else:
+        if len(bot['positions']) >= cfg['max_positions']: return False
+        used = sum(pos['cost'] for pos in bot['positions'].values())
+        budget = min(cfg['position_usd'], cfg['max_exposure']-used, bot['cash'])
     if budget < 10: return False
     cost_price = q['ask'] * (1+cfg['slippage_rate'])
     fee = budget * cfg['fee_rate']
@@ -193,15 +201,18 @@ def update_risk(name,bot,quotes,cfg):
         net_peak = pos['qty']*pos['highest_bid']*(1-cfg['slippage_rate'])*(1-cfg['fee_rate'])
         loss = (net_current/pos['cost'])-1
         peak = (net_peak/pos['cost'])-1
-        why = ('stop threshold' if loss <= -cfg['stop_loss'] else
-               'trailing profit' if peak >= cfg['trailing_activation'] and
-                 q['bid'] <= pos['highest_bid']*(1-cfg['trailing_distance']) else None)
+        stop = black.STOP_LOSS if name == 'All on Black' else cfg['stop_loss']
+        activation = black.TRAILING_ACTIVATION if name == 'All on Black' else cfg['trailing_activation']
+        distance = black.TRAILING_DISTANCE if name == 'All on Black' else cfg['trailing_distance']
+        why = ('stop threshold' if loss <= -stop else
+               'trailing profit' if peak >= activation and
+                 q['bid'] <= pos['highest_bid']*(1-distance) else None)
         if why:
             pnl = exit_position(name,bot,pair,q,cfg,why)
             print(f'  PAPER SELL {name}: {pair} {pnl:+.2f} ({why})')
 
 
-def check_pause(bot, total, cfg):
+def check_pause(name, bot, total, cfg):
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     if bot['day'] != today:
         bot['day'] = today
@@ -210,7 +221,8 @@ def check_pause(bot, total, cfg):
     bot['peak_equity'] = max(bot['peak_equity'],total)
     bot['max_drawdown'] = max(bot['max_drawdown'],1-total/bot['peak_equity'])
     bot['last_equity'] = total
-    if bot['day_start_equity'] - total >= cfg['daily_loss_pause_usd']:
+    daily_limit = black.DAILY_LOSS_PAUSE if name == 'All on Black' else cfg['daily_loss_pause_usd']
+    if bot['day_start_equity'] - total >= daily_limit:
         bot['paused'] = True
 
 
@@ -258,7 +270,7 @@ def dashboard(state,cfg,mode='unknown',last_scan=0,errors=0):
                 '<td>'+f'{b["max_drawdown"]:.1%}'+'</td><td>'+('PAUSED' if b['paused'] else ('AI NOT CONFIGURED' if name=='Hybrid AI' and not os.getenv('OPENAI_API_KEY') else 'RUNNING'))+'</td></tr>'
                 for name,b,ret in balances)
     details=''.join('<section><h2>'+html.escape(name)+'</h2><p>Cash: $'+f'{state["bots"][name]["cash"]:,.2f}'+' | Realized P/L: $'+f'{state["bots"][name]["realized_pnl"]:+,.2f}'+'</p><ul>'+(''.join('<li>'+html.escape(p)+' — $'+f'{pos["cost"]:.2f}'+' invested</li>' for p,pos in state['bots'][name]['positions'].items()) or '<li>No open positions</li>')+'</ul></section>' for name in NAMES)
-    page='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coinbase Paper Bot Competition</title><style>body{font:16px system-ui;background:#0b1220;color:#e8eef9;max-width:1050px;margin:30px auto;padding:0 18px}h1{font-size:28px}small,p{color:#a9b7ce}table{border-collapse:collapse;width:100%;background:#131f34;border-radius:12px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2b3850;text-align:left}th{background:#213350}section{background:#131f34;border-radius:12px;padding:12px 22px;margin:16px 0}li{padding:3px}strong{color:#b2d0ff} .scroll{overflow-x:auto}</style></head><body><h1>Coinbase paper-trading competition</h1><p><strong>SIMULATED MONEY ONLY — NO REAL ORDERS.</strong> Each bot starts with $1,000 and has a maximum $200 active exposure. Sniper listing age is an estimate from candle history, not an official launch date. Fees/slippage are estimates.</p>'''
+    page='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coinbase Paper Bot Competition</title><style>body{font:16px system-ui;background:#0b1220;color:#e8eef9;max-width:1050px;margin:30px auto;padding:0 18px}h1{font-size:28px}small,p{color:#a9b7ce}table{border-collapse:collapse;width:100%;background:#131f34;border-radius:12px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2b3850;text-align:left}th{background:#213350}section{background:#131f34;border-radius:12px;padding:12px 22px;margin:16px 0}li{padding:3px}strong{color:#b2d0ff} .scroll{overflow-x:auto}</style></head><body><h1>Coinbase paper-trading competition</h1><p><strong>SIMULATED MONEY ONLY — NO REAL ORDERS.</strong> Each bot starts with $1,000. Regular strategies have a $200 active exposure cap; All on Black can place its full simulated balance in one coin. Sniper listing age is an estimate from candle history, not an official launch date. Fees/slippage are estimates.</p>'''
     page+='<p>Updated '+html.escape(cb.utc_now())+' UTC | completed cycles '+str(state['cycle'])+' | last pairs scanned '+str(last_scan)+' | errors '+str(errors)+' | '+html.escape(mode)+'</p>'
     page+='<div class="scroll"><table><thead><tr><th>Bot</th><th>Equity</th><th>Return</th><th>Positions</th><th>Wins/Losses</th><th>Max drawdown</th><th>Status</th></tr></thead><tbody>'+trs+'</tbody></table></div>'+details
     page+='<p>Leaderboard is updated after scans and refreshed by the browser every 60 seconds. Returns are not performance predictions. See trades.csv, signals.csv, leaderboard.csv for raw records.</p></body></html>'
@@ -304,17 +316,17 @@ def tick(state,session,cfg):
     # Mark accounts and close risk-triggered positions before allowing fresh entries.
     for name,b in state['bots'].items():
         update_risk(name,b,quotes,cfg)
-        check_pause(b,mark(b,quotes,cfg),cfg)
+        check_pause(name,b,mark(b,quotes,cfg),cfg)
     approvals,mode=ai_approval(candidate['Hybrid AI'][:cfg['ai_shortlist']],cfg)
     for name,b in state['bots'].items():
-        for item in candidate[name][:8]:
+        for item in candidate[name][:1 if name == 'All on Black' else 8]:
             pair=item['pair'];q=quotes.get(pair)
             if b['paused'] or not q or q['spread'] > cfg['max_spread_pct']: continue
             if name=='Hybrid AI' and pair not in approvals: continue
             if pair in b['positions'] or time.time()-b['cooldowns'].get(pair,0)<cfg['cooldown_minutes']*60: continue
             if enter(name,b,pair,q,cfg,'AI-approved momentum' if name=='Hybrid AI' else 'rule signal'):
                 print(f'  PAPER BUY {name}: {pair} @ {q["ask"]:.8g}')
-        check_pause(b,mark(b,quotes,cfg),cfg)
+        check_pause(name,b,mark(b,quotes,cfg),cfg)
         csv_append(SNAPSHOTS,{'utc':cb.utc_now(),'cycle':state['cycle']+1,'bot':name,
                               'equity':round(b['last_equity'],5),'cash':round(b['cash'],5),
                               'positions':len(b['positions']),'realized_pnl':round(b['realized_pnl'],5),
@@ -340,7 +352,7 @@ def tick(state,session,cfg):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Five Coinbase public-data PAPER bots')
+    p=argparse.ArgumentParser(description='Six Coinbase public-data PAPER bots')
     p.add_argument('--once',action='store_true')
     p.add_argument('--status',action='store_true')
     p.add_argument('--reset',action='store_true')
