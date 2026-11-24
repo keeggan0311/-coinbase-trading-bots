@@ -1,4 +1,4 @@
-"""Four simultaneous Coinbase market-data paper traders. NO order or auth endpoints."""
+"""Five Coinbase public-data paper traders. NO order or authentication endpoints."""
 from __future__ import annotations
 import argparse
 import csv
@@ -15,6 +15,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 import market_base as cb
+import new_listing_sniper as sniper
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -23,7 +24,7 @@ EVENTS = DATA / 'trades.csv'
 SNAPSHOTS = DATA / 'leaderboard.csv'
 SIGNALS = DATA / 'signals.csv'
 DASH = DATA / 'dashboard.html'
-NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI']
+NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI', 'New Coin Sniper']
 
 
 def config():
@@ -39,11 +40,14 @@ def config():
 
 def new_state(cfg):
     return {'schema': 2, 'created': cb.utc_now(), 'cycle': 0, 'bots': {
-        name: {'cash': cfg['starting_balance'], 'positions': {}, 'cooldowns': {},
-               'realized_pnl': 0, 'wins': 0, 'losses': 0, 'paused': False,
-               'last_equity': cfg['starting_balance'], 'peak_equity': cfg['starting_balance'],
-               'max_drawdown': 0, 'day': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
-               'day_start_equity': cfg['starting_balance']} for name in NAMES}}
+        name: fresh_bot(cfg) for name in NAMES}, 'sniper_catalog': {'initialized': False, 'known': []}}
+
+def fresh_bot(cfg):
+    return {'cash': cfg['starting_balance'], 'positions': {}, 'cooldowns': {},
+            'realized_pnl': 0, 'wins': 0, 'losses': 0, 'paused': False,
+            'last_equity': cfg['starting_balance'], 'peak_equity': cfg['starting_balance'],
+            'max_drawdown': 0, 'day': datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+            'day_start_equity': cfg['starting_balance']}
 
 
 def save(state):
@@ -60,8 +64,15 @@ def load(cfg):
         save(st)
         return st
     st = json.loads(STATE.read_text(encoding='utf-8'))
-    if st.get('schema') != 2 or set(st['bots']) != set(NAMES):
-        raise RuntimeError('State format mismatch; back up data before reset')
+    if st.get('schema') != 2 or not set(st['bots']).issubset(set(NAMES)):
+        raise RuntimeError('Unrecognized state format; stop and inspect the backup')
+    # Add only missing competitors; never alter prior balances, positions or history.
+    for name in NAMES:
+        if name not in st['bots']:
+            st['bots'][name] = fresh_bot(cfg)
+            print(f'Added paper account: {name} ($'+str(cfg['starting_balance'])+')')
+    st.setdefault('sniper_catalog', {'initialized': False, 'known': []})
+    save(st)
     return st
 
 
@@ -108,6 +119,7 @@ def signal(strategy, f):
         rebound = p/f['low_recent'] - 1
         if not (.05 <= draw <= .45 and .008 <= rebound <= .12 and .002 <= h <= .085 and vr >= 1.1): return None
         return round(min(100, 30 + min(30,rebound*300) + min(25,(vr-1)*14) + min(15,draw*100)),1)
+    if strategy == 'New Coin Sniper': return None  # separate short-history screen
     raise ValueError(strategy)
 
 
@@ -246,7 +258,7 @@ def dashboard(state,cfg,mode='unknown',last_scan=0,errors=0):
                 '<td>'+f'{b["max_drawdown"]:.1%}'+'</td><td>'+('PAUSED' if b['paused'] else ('AI NOT CONFIGURED' if name=='Hybrid AI' and not os.getenv('OPENAI_API_KEY') else 'RUNNING'))+'</td></tr>'
                 for name,b,ret in balances)
     details=''.join('<section><h2>'+html.escape(name)+'</h2><p>Cash: $'+f'{state["bots"][name]["cash"]:,.2f}'+' | Realized P/L: $'+f'{state["bots"][name]["realized_pnl"]:+,.2f}'+'</p><ul>'+(''.join('<li>'+html.escape(p)+' — $'+f'{pos["cost"]:.2f}'+' invested</li>' for p,pos in state['bots'][name]['positions'].items()) or '<li>No open positions</li>')+'</ul></section>' for name in NAMES)
-    page='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coinbase Paper Bot Competition</title><style>body{font:16px system-ui;background:#0b1220;color:#e8eef9;max-width:1050px;margin:30px auto;padding:0 18px}h1{font-size:28px}small,p{color:#a9b7ce}table{border-collapse:collapse;width:100%;background:#131f34;border-radius:12px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2b3850;text-align:left}th{background:#213350}section{background:#131f34;border-radius:12px;padding:12px 22px;margin:16px 0}li{padding:3px}strong{color:#b2d0ff} .scroll{overflow-x:auto}</style></head><body><h1>Coinbase paper-trading competition</h1><p><strong>SIMULATED MONEY ONLY — NO REAL ORDERS.</strong> Each bot starts with $1,000 and has a maximum $200 active exposure. Fees/slippage are estimates.</p>'''
+    page='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coinbase Paper Bot Competition</title><style>body{font:16px system-ui;background:#0b1220;color:#e8eef9;max-width:1050px;margin:30px auto;padding:0 18px}h1{font-size:28px}small,p{color:#a9b7ce}table{border-collapse:collapse;width:100%;background:#131f34;border-radius:12px;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2b3850;text-align:left}th{background:#213350}section{background:#131f34;border-radius:12px;padding:12px 22px;margin:16px 0}li{padding:3px}strong{color:#b2d0ff} .scroll{overflow-x:auto}</style></head><body><h1>Coinbase paper-trading competition</h1><p><strong>SIMULATED MONEY ONLY — NO REAL ORDERS.</strong> Each bot starts with $1,000 and has a maximum $200 active exposure. Sniper listing age is an estimate from candle history, not an official launch date. Fees/slippage are estimates.</p>'''
     page+='<p>Updated '+html.escape(cb.utc_now())+' UTC | completed cycles '+str(state['cycle'])+' | last pairs scanned '+str(last_scan)+' | errors '+str(errors)+' | '+html.escape(mode)+'</p>'
     page+='<div class="scroll"><table><thead><tr><th>Bot</th><th>Equity</th><th>Return</th><th>Positions</th><th>Wins/Losses</th><th>Max drawdown</th><th>Status</th></tr></thead><tbody>'+trs+'</tbody></table></div>'+details
     page+='<p>Leaderboard is updated after scans and refreshed by the browser every 60 seconds. Returns are not performance predictions. See trades.csv, signals.csv, leaderboard.csv for raw records.</p></body></html>'
@@ -271,8 +283,13 @@ def tick(state,session,cfg):
     # Get quotes for holdings regardless of whether they're in this scan rotation;
     # also quote entry candidates to avoid querying all 25 every loop.
     candidate={name:[] for name in NAMES}
+    # Short-history screening is independent of the 96-candle legacy feature requirement.
+    sniper_candidates = sniper.scan_new_listings(session, state, cfg, cb, universe)
+    candidate['New Coin Sniper'] = sniper_candidates
     for pair,f in features_by_pair.items():
         for name in NAMES:
+            if name == 'New Coin Sniper':
+                continue
             score=signal(name,f)
             if score is not None:
                 candidate[name].append({'pair':pair,'score':score,'features':f})
@@ -323,7 +340,7 @@ def tick(state,session,cfg):
 
 
 def main():
-    p=argparse.ArgumentParser(description='Four Coinbase public-data PAPER bots')
+    p=argparse.ArgumentParser(description='Five Coinbase public-data PAPER bots')
     p.add_argument('--once',action='store_true')
     p.add_argument('--status',action='store_true')
     p.add_argument('--reset',action='store_true')
