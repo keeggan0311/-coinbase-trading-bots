@@ -29,6 +29,10 @@ SIGNALS = DATA / 'signals.csv'
 DASH = DATA / 'dashboard.html'
 NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI', 'New Coin Sniper', 'All on Black']
 STATE_LOCK = threading.RLock()  # One state writer at a time: scanner or WebSocket thread
+# Latest live quote per pair, held only in memory. A fresh WS quote takes
+# precedence over a REST quote fetched earlier in the scan cycle.
+WS_QUOTES = {}
+WS_QUOTE_MAX_AGE = 30.0
 
 
 def config():
@@ -191,7 +195,7 @@ def exit_position(name,bot,pair,q,cfg,reason):
     return pnl
 
 
-def update_risk(name,bot,quotes,cfg):
+def update_risk(name,bot,quotes,cfg,source='REST'):
     for pair in list(bot['positions']):
         if pair not in quotes:
             print(f'  WARN {name}: {pair} exit quote unavailable')
@@ -211,8 +215,9 @@ def update_risk(name,bot,quotes,cfg):
                'trailing profit' if peak >= activation and
                  q['bid'] <= pos['highest_bid']*(1-distance) else None)
         if why:
-            pnl = exit_position(name,bot,pair,q,cfg,why)
-            print(f'  PAPER SELL {name}: {pair} {pnl:+.2f} ({why})')
+            reason = ('WS ' + why) if source == 'WS' else why
+            pnl = exit_position(name,bot,pair,q,cfg,reason)
+            print(f'  PAPER SELL {name}: {pair} {pnl:+.2f} ({reason})')
 
 
 def check_pause(name, bot, total, cfg):
@@ -304,6 +309,13 @@ def tick(state,session,cfg):
         time.sleep(.11)
     approvals,mode=ai_approval(candidate['Hybrid AI'][:cfg['ai_shortlist']],cfg)
     with STATE_LOCK:
+        # REST requests were made outside this lock. Do not overwrite newer live
+        # quotes with older HTTP responses when assessing held positions.
+        now = time.monotonic()
+        for pair in held:
+            fresh = WS_QUOTES.get(pair)
+            if fresh and now - fresh[1] <= WS_QUOTE_MAX_AGE:
+                quotes[pair] = dict(fresh[0])
         # Mark accounts and close risk-triggered positions before allowing fresh entries.
         for name,b in state['bots'].items():
             update_risk(name,b,quotes,cfg)
@@ -342,39 +354,59 @@ def tick(state,session,cfg):
 
 
 def start_ws_monitor(state, cfg):
-    """Start paper-only bid monitor in same process, sharing account state lock.
+    """One paper-only ticker connection monitors all held pairs, across all bots.
 
-    A disconnected stream does not fabricate quotes; normal REST scans still
-    check stop losses. Only the selected All on Black account is monitored.
+    Strategy entries remain in the REST scanner. This callback only evaluates
+    existing positions, using the exact same exit rules as scheduled scans.
+    State and dashboard writes are serialized with the scanner via STATE_LOCK.
     """
     last_written = [0.0]
     last_dashboard = [0.0]
+    processed = [0]
+    last_health_log = [0.0]
+
     def pairs():
         with STATE_LOCK:
-            return list(state['bots']['All on Black']['positions'])
+            return sorted(set().union(*(set(b['positions']) for b in state['bots'].values())))
 
     def on_quote(pair, q):
         with STATE_LOCK:
-            b = state['bots']['All on Black']
-            if pair not in b['positions']:
+            # Cache quotes only for held pairs; never let stale REST overwrite them.
+            if not any(pair in b['positions'] for b in state['bots'].values()):
                 return
-            before = len(b['positions'])
-            previous_peak = b['positions'][pair]['highest_bid']
-            update_risk('All on Black', b, {pair:q}, cfg)
-            total = mark(b, {pair:q}, cfg)
-            check_pause('All on Black', b, total, cfg)
-            exited = len(b['positions']) < before
-            raised_peak = pair in b['positions'] and b['positions'][pair]['highest_bid'] > previous_peak
             now = time.monotonic()
-            # Atomic file writes while holding lock; no duplicate entries or stale overwrite.
-            if exited or raised_peak or now-last_written[0] >= 15:
+            WS_QUOTES[pair] = (dict(q), now)
+            processed[0] += 1
+            exited_names = []
+            raised_any_peak = False
+            for name, b in state['bots'].items():
+                if pair not in b['positions']:
+                    continue
+                before = len(b['positions'])
+                previous_peak = b['positions'][pair]['highest_bid']
+                update_risk(name, b, {pair: q}, cfg, source='WS')
+                # mark() uses last_bid for other positions; those are retained
+                # until a new valid quote arrives for each of them.
+                total = mark(b, {pair: q}, cfg)
+                check_pause(name, b, total, cfg)
+                if len(b['positions']) < before:
+                    exited_names.append(name)
+                elif b['positions'][pair]['highest_bid'] > previous_peak:
+                    raised_any_peak = True
+            # Drop obsolete quote cache entries when a pair is no longer held.
+            if not any(pair in b['positions'] for b in state['bots'].values()):
+                WS_QUOTES.pop(pair, None)
+            if exited_names or raised_any_peak or now - last_written[0] >= 15:
                 save(state)
                 last_written[0] = now
-            if exited or now-last_dashboard[0] >= 30:
-                dashboard(state, cfg, 'AI OFF (WS monitoring)', cfg['scan_limit'], 0)
+            if exited_names or now - last_dashboard[0] >= 30:
+                dashboard(state, cfg, 'AI OFF (WS monitoring)' if not os.getenv('OPENAI_API_KEY') else 'AI configured (WS monitoring)', cfg['scan_limit'], 0)
                 last_dashboard[0] = now
-            if exited:
-                print(f'  WS PAPER exit confirmed for {pair}; account saved')
+            if exited_names:
+                print(f'  WS PAPER exits for {pair}: {", ".join(exited_names)}; state saved', flush=True)
+            if now - last_health_log[0] >= 60:
+                print(f'  WS HEALTH: {processed[0]} valid quotes processed; last={pair} bid={q["bid"]:.8g}; bots holding={sum(pair in b["positions"] for b in state["bots"].values())}', flush=True)
+                last_health_log[0] = now
 
     monitor = PaperPriceMonitor(pairs, on_quote)
     monitor.start()
