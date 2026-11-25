@@ -1,4 +1,4 @@
-"""Paper-only Coinbase Exchange ticker stream for All on Black positions.
+"""Paper-only Coinbase Exchange ticker stream for all paper-bot positions.
 
 No exchange authentication, order methods, or real-money trading functionality.
 Uses ticker best_bid/best_ask (never last trade price) for simulated risk exits.
