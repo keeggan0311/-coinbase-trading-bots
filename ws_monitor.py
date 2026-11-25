@@ -21,7 +21,17 @@ def ticker_quote(message):
         ask = float(message.get('best_ask'))
         if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
             return None
-        return {'bid': bid, 'ask': ask, 'spread': (ask - bid) / ((ask + bid) / 2)}
+        quote = {'bid': bid, 'ask': ask, 'spread': (ask - bid) / ((ask + bid) / 2)}
+        # Per-ticker trade size is an approximate sample, not authoritative volume.
+        try:
+            price = float(message['price'])
+            size = float(message['last_size'])
+            if math.isfinite(price) and math.isfinite(size) and price > 0 and size > 0:
+                quote.update(trade_price=price, last_size=size,
+                             trade_id=message.get('trade_id'))
+        except (KeyError, TypeError, ValueError):
+            pass
+        return quote
     except (ValueError, TypeError, ZeroDivisionError):
         return None
 
@@ -32,11 +42,12 @@ class PaperPriceMonitor:
     current_pairs is queried from the shared, locked state. Subscribe/reconnect when
     the held-pair set changes, including when a position is opened or closed.
     """
-    def __init__(self, current_pairs, on_quote, log=print, poll_seconds=2):
+    def __init__(self, current_pairs, on_quote, log=print, poll_seconds=2, on_reconnect=None):
         self.current_pairs = current_pairs
         self.on_quote = on_quote
         self.log = log
         self.poll_seconds = poll_seconds
+        self.on_reconnect = on_reconnect
         self.stopping = threading.Event()
         self.thread = None
 
@@ -62,6 +73,7 @@ class PaperPriceMonitor:
             sock = None
             try:
                 sock = websocket.create_connection(URL, timeout=self.poll_seconds, enable_multithread=True)
+                if self.on_reconnect is not None: self.on_reconnect()
                 sock.send(json.dumps({'type': 'subscribe', 'product_ids': pairs,
                                       'channels': ['ticker', 'heartbeat']}))
                 self.log(f'  WS PAPER monitoring: {", ".join(pairs)}')
