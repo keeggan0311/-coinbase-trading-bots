@@ -19,6 +19,7 @@ import market_base as cb
 import new_listing_sniper as sniper
 import all_on_black as black
 from ws_monitor import PaperPriceMonitor
+from live_entry import LiveEntryTracker
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -33,6 +34,12 @@ STATE_LOCK = threading.RLock()  # One state writer at a time: scanner or WebSock
 # precedence over a REST quote fetched earlier in the scan cycle.
 WS_QUOTES = {}
 WS_QUOTE_MAX_AGE = 30.0
+LIVE_ENTRY_WATCHLIST = set()  # REST-discovered Coinbase USD pairs, bounded
+LIVE_ENTRY_UPDATED = 0.0
+LIVE_ENTRY_ROTATION_SECONDS = 600.0
+LIVE_ENTRY_MAX_PAIRS = 50
+LIVE_ENTRY_TRACKER = LiveEntryTracker()
+LIVE_LAST_BUY = {}  # per-bot monotonic timestamp; rate-limit rapid repeated entries
 
 
 def config():
@@ -198,7 +205,8 @@ def exit_position(name,bot,pair,q,cfg,reason):
 def update_risk(name,bot,quotes,cfg,source='REST'):
     for pair in list(bot['positions']):
         if pair not in quotes:
-            print(f'  WARN {name}: {pair} exit quote unavailable')
+            if source != 'WS':
+                print(f'  WARN {name}: {pair} exit quote unavailable')
             continue
         q = quotes[pair]
         pos = bot['positions'][pair]
@@ -275,6 +283,14 @@ def dashboard(state,cfg,mode='unknown',last_scan=0,errors=0):
 def tick(state,session,cfg):
     # Share both candle history and ticker data so comparisons receive identical observations.
     universe=cb.products(session,cfg)
+    # Refresh the bounded entry watchlist at most once every ten minutes.
+    # Short REST scan rotation is retained for historical entry strategies.
+    global LIVE_ENTRY_UPDATED
+    with STATE_LOCK:
+        if time.monotonic() - LIVE_ENTRY_UPDATED > LIVE_ENTRY_ROTATION_SECONDS:
+            LIVE_ENTRY_WATCHLIST.clear()
+            LIVE_ENTRY_WATCHLIST.update(universe[:LIVE_ENTRY_MAX_PAIRS])
+            LIVE_ENTRY_UPDATED = time.monotonic()
     rows_by_pair={}; features_by_pair={}; quotes={}; errors=0
     with STATE_LOCK:
         held=set().union(*(set(b['positions']) for b in state['bots'].values()))
@@ -367,14 +383,17 @@ def start_ws_monitor(state, cfg):
 
     def pairs():
         with STATE_LOCK:
-            return sorted(set().union(*(set(b['positions']) for b in state['bots'].values())))
+            held = set().union(*(set(b['positions']) for b in state['bots'].values()))
+            return sorted(held | LIVE_ENTRY_WATCHLIST)
 
     def on_quote(pair, q):
         with STATE_LOCK:
-            # Cache quotes only for held pairs; never let stale REST overwrite them.
-            if not any(pair in b['positions'] for b in state['bots'].values()):
-                return
             now = time.monotonic()
+            held_before = any(pair in b['positions'] for b in state['bots'].values())
+            # Only follow a REST-verified eligible discovery pair (or existing holding).
+            if not held_before and pair not in LIVE_ENTRY_WATCHLIST:
+                return
+            metrics = LIVE_ENTRY_TRACKER.observe(pair, q, now)
             WS_QUOTES[pair] = (dict(q), now)
             processed[0] += 1
             exited_names = []
@@ -393,22 +412,43 @@ def start_ws_monitor(state, cfg):
                     exited_names.append(name)
                 elif b['positions'][pair]['highest_bid'] > previous_peak:
                     raised_any_peak = True
-            # Drop obsolete quote cache entries when a pair is no longer held.
-            if not any(pair in b['positions'] for b in state['bots'].values()):
+            # Real-time entries: independently qualified momentum and observed
+            # activity. Same position, pause, spread, cooldown and budget rules
+            # as regular scanner entries. No exchange order methods exist.
+            bought = []
+            if pair in LIVE_ENTRY_WATCHLIST and metrics and q['spread'] <= cfg['max_spread_pct']:
+                for name in ('New Coin Sniper', 'All on Black'):
+                    b = state['bots'][name]
+                    if b['paused'] or pair in b['positions']:
+                        continue
+                    if now - LIVE_LAST_BUY.get(name, -1e9) < 120:
+                        continue
+                    if time.time() - b['cooldowns'].get(pair,0) < cfg['cooldown_minutes']*60:
+                        continue
+                    if LIVE_ENTRY_TRACKER.select(pair,q,metrics,name,now):
+                        if enter(name,b,pair,q,cfg,'WS live momentum + observed trade activity'):
+                            LIVE_LAST_BUY[name] = now
+                            bought.append(name)
+                            check_pause(name,b,mark(b,{pair:q},cfg),cfg)
+            # Keep cache for watched pairs; it is consulted only while fresh.
+            if not any(pair in b['positions'] for b in state['bots'].values()) and pair not in LIVE_ENTRY_WATCHLIST:
                 WS_QUOTES.pop(pair, None)
-            if exited_names or raised_any_peak or now - last_written[0] >= 15:
+            if exited_names or bought or raised_any_peak or now - last_written[0] >= 15:
                 save(state)
                 last_written[0] = now
-            if exited_names or now - last_dashboard[0] >= 30:
+            if exited_names or bought or now - last_dashboard[0] >= 30:
                 dashboard(state, cfg, 'AI OFF (WS monitoring)' if not os.getenv('OPENAI_API_KEY') else 'AI configured (WS monitoring)', cfg['scan_limit'], 0)
                 last_dashboard[0] = now
             if exited_names:
                 print(f'  WS PAPER exits for {pair}: {", ".join(exited_names)}; state saved', flush=True)
+            if bought:
+                print(f'  WS PAPER buys for {pair}: {", ".join(bought)}; state saved', flush=True)
             if now - last_health_log[0] >= 60:
                 print(f'  WS HEALTH: {processed[0]} valid quotes processed; last={pair} bid={q["bid"]:.8g}; bots holding={sum(pair in b["positions"] for b in state["bots"].values())}', flush=True)
                 last_health_log[0] = now
 
-    monitor = PaperPriceMonitor(pairs, on_quote)
+    # Discard warm-up samples on every reconnect / subscription change.
+    monitor = PaperPriceMonitor(pairs, on_quote, on_reconnect=LIVE_ENTRY_TRACKER.reset)
     monitor.start()
     return monitor
 
