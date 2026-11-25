@@ -8,6 +8,7 @@ import math
 import os
 import statistics
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 import market_base as cb
 import new_listing_sniper as sniper
 import all_on_black as black
+from ws_monitor import PaperPriceMonitor
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
@@ -26,6 +28,7 @@ SNAPSHOTS = DATA / 'leaderboard.csv'
 SIGNALS = DATA / 'signals.csv'
 DASH = DATA / 'dashboard.html'
 NAMES = ['Momentum Hunter', 'Breakout Trader', 'Dip Buyer', 'Hybrid AI', 'New Coin Sniper', 'All on Black']
+STATE_LOCK = threading.RLock()  # One state writer at a time: scanner or WebSocket thread
 
 
 def config():
@@ -268,7 +271,8 @@ def tick(state,session,cfg):
     # Share both candle history and ticker data so comparisons receive identical observations.
     universe=cb.products(session,cfg)
     rows_by_pair={}; features_by_pair={}; quotes={}; errors=0
-    held=set().union(*(set(b['positions']) for b in state['bots'].values()))
+    with STATE_LOCK:
+        held=set().union(*(set(b['positions']) for b in state['bots'].values()))
     for pair in universe:
         try:
             rows=cb.candles(session,pair)
@@ -298,42 +302,83 @@ def tick(state,session,cfg):
         try: quotes[pair]=quote(session,pair)
         except Exception as e: errors+=1;print(f'  quote warning {pair}: {e}')
         time.sleep(.11)
-    # Mark accounts and close risk-triggered positions before allowing fresh entries.
-    for name,b in state['bots'].items():
-        update_risk(name,b,quotes,cfg)
-        check_pause(name,b,mark(b,quotes,cfg),cfg)
     approvals,mode=ai_approval(candidate['Hybrid AI'][:cfg['ai_shortlist']],cfg)
-    for name,b in state['bots'].items():
-        for item in candidate[name][:1 if name == 'All on Black' else 8]:
-            pair=item['pair'];q=quotes.get(pair)
-            if b['paused'] or not q or q['spread'] > cfg['max_spread_pct']: continue
-            if name=='Hybrid AI' and pair not in approvals: continue
-            if pair in b['positions'] or time.time()-b['cooldowns'].get(pair,0)<cfg['cooldown_minutes']*60: continue
-            if enter(name,b,pair,q,cfg,'AI-approved momentum' if name=='Hybrid AI' else 'rule signal'):
-                print(f'  PAPER BUY {name}: {pair} @ {q["ask"]:.8g}')
-        check_pause(name,b,mark(b,quotes,cfg),cfg)
-        csv_append(SNAPSHOTS,{'utc':cb.utc_now(),'cycle':state['cycle']+1,'bot':name,
-                              'equity':round(b['last_equity'],5),'cash':round(b['cash'],5),
-                              'positions':len(b['positions']),'realized_pnl':round(b['realized_pnl'],5),
-                              'wins':b['wins'],'losses':b['losses'],
-                              'max_drawdown':round(b['max_drawdown'],6),'paused':b['paused']})
-    for name,items in candidate.items():
-        for item in items[:8]:
-            f=item['features']
-            csv_append(SIGNALS,{'utc':cb.utc_now(),'cycle':state['cycle']+1,'bot':name,
-                                'pair':item['pair'],'score':item['score'],
-                                'hour_return':round(f['hour'],6),
-                                'volume_ratio':round(f['vol_ratio'],4),
-                                'usd_volume_24h':round(f['vol_usd'],2)})
-    state['cycle']+=1
-    save(state)
-    dashboard(state,cfg,mode,len(universe),errors)
+    with STATE_LOCK:
+        # Mark accounts and close risk-triggered positions before allowing fresh entries.
+        for name,b in state['bots'].items():
+            update_risk(name,b,quotes,cfg)
+            check_pause(name,b,mark(b,quotes,cfg),cfg)
+        for name,b in state['bots'].items():
+            for item in candidate[name][:1 if name == 'All on Black' else 8]:
+                pair=item['pair'];q=quotes.get(pair)
+                if b['paused'] or not q or q['spread'] > cfg['max_spread_pct']: continue
+                if name=='Hybrid AI' and pair not in approvals: continue
+                if pair in b['positions'] or time.time()-b['cooldowns'].get(pair,0)<cfg['cooldown_minutes']*60: continue
+                if enter(name,b,pair,q,cfg,'AI-approved momentum' if name=='Hybrid AI' else 'rule signal'):
+                    print(f'  PAPER BUY {name}: {pair} @ {q["ask"]:.8g}')
+            check_pause(name,b,mark(b,quotes,cfg),cfg)
+            csv_append(SNAPSHOTS,{'utc':cb.utc_now(),'cycle':state['cycle']+1,'bot':name,
+                                  'equity':round(b['last_equity'],5),'cash':round(b['cash'],5),
+                                  'positions':len(b['positions']),'realized_pnl':round(b['realized_pnl'],5),
+                                  'wins':b['wins'],'losses':b['losses'],
+                                  'max_drawdown':round(b['max_drawdown'],6),'paused':b['paused']})
+        for name,items in candidate.items():
+            for item in items[:8]:
+                f=item['features']
+                csv_append(SIGNALS,{'utc':cb.utc_now(),'cycle':state['cycle']+1,'bot':name,
+                                    'pair':item['pair'],'score':item['score'],
+                                    'hour_return':round(f['hour'],6),
+                                    'volume_ratio':round(f['vol_ratio'],4),
+                                    'usd_volume_24h':round(f['vol_usd'],2)})
+        state['cycle']+=1
+        save(state)
+        dashboard(state,cfg,mode,len(universe),errors)
     print('\n  LEADERBOARD (simulated)')
     for name in sorted(NAMES,key=lambda n:state['bots'][n]['last_equity'],reverse=True):
         b=state['bots'][name]
         print(f'  {name:18} ${b["last_equity"]:9.2f} positions={len(b["positions"])} W/L={b["wins"]}/{b["losses"]}')
     print(f'  AI: {mode}. Scan: {len(universe)} pairs, warnings: {errors}')
     return True
+
+
+def start_ws_monitor(state, cfg):
+    """Start paper-only bid monitor in same process, sharing account state lock.
+
+    A disconnected stream does not fabricate quotes; normal REST scans still
+    check stop losses. Only the selected All on Black account is monitored.
+    """
+    last_written = [0.0]
+    last_dashboard = [0.0]
+    def pairs():
+        with STATE_LOCK:
+            return list(state['bots']['All on Black']['positions'])
+
+    def on_quote(pair, q):
+        with STATE_LOCK:
+            b = state['bots']['All on Black']
+            if pair not in b['positions']:
+                return
+            before = len(b['positions'])
+            previous_peak = b['positions'][pair]['highest_bid']
+            update_risk('All on Black', b, {pair:q}, cfg)
+            total = mark(b, {pair:q}, cfg)
+            check_pause('All on Black', b, total, cfg)
+            exited = len(b['positions']) < before
+            raised_peak = pair in b['positions'] and b['positions'][pair]['highest_bid'] > previous_peak
+            now = time.monotonic()
+            # Atomic file writes while holding lock; no duplicate entries or stale overwrite.
+            if exited or raised_peak or now-last_written[0] >= 15:
+                save(state)
+                last_written[0] = now
+            if exited or now-last_dashboard[0] >= 30:
+                dashboard(state, cfg, 'AI OFF (WS monitoring)', cfg['scan_limit'], 0)
+                last_dashboard[0] = now
+            if exited:
+                print(f'  WS PAPER exit confirmed for {pair}; account saved')
+
+    monitor = PaperPriceMonitor(pairs, on_quote)
+    monitor.start()
+    return monitor
 
 
 def main():
@@ -361,16 +406,22 @@ def main():
     print('PAPER TRADING ONLY. No exchange authentication. No real orders.')
     print('Dashboard: '+str(DASH))
     sess=requests.Session();sess.headers.update(cb.HEADERS)
+    monitor = None if a.once else start_ws_monitor(state, cfg)
     try:
         while True:
             print('\n['+cb.utc_now()+'] Starting scan...')
             try: tick(state,sess,cfg)
             except Exception as e:
-                print(f'Cycle error; simulation unchanged where possible: {type(e).__name__}: {e}')
-                save(state)
+                print(f'Cycle error; inspect state: {type(e).__name__}: {e}')
+                with STATE_LOCK:
+                    save(state)
             if a.once: break
             time.sleep(cfg['loop_seconds'])
     except KeyboardInterrupt:
-        save(state);print('Stopped; saved simulated balances')
+        with STATE_LOCK:
+            save(state)
+        print('Stopped; saved simulated balances')
+    finally:
+        if monitor is not None: monitor.stop()
 
 if __name__=='__main__': main()
